@@ -1,0 +1,26 @@
+# Physics Engine & Gymnasium Integration
+# gym==0.25.1
+# pybullet==3.2.6
+
+gymnasium
+gymnasium[mujoco]
+
+
+# Deep Learning Framework
+torch
+
+# Experiment Tracking
+wandb
+wandb[media]
+# Core dependencies
+numpy
+
+# Visualization
+matplotlib
+seaborn
+pandas
+
+# For rendering
+pygame
+ipykernel
+
