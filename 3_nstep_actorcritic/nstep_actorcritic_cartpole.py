@@ -64,8 +64,8 @@ class PolicyNet(nn.Module):
         x = self.net(x)
         return self.policy_head(x), self.critic_head(x)
     
-    
-def experience_generator(env, policy, gamma, n_steps):
+#discrete actions experience generator
+def da_experience_generator(env, policy, gamma, n_steps): 
     while True: 
         state_list = []
         action_list = []
@@ -76,6 +76,7 @@ def experience_generator(env, policy, gamma, n_steps):
         
         done = False
         ep_rew = 0
+        ep_steps= 0
         state, _ = env.reset()
         while not done:
             state_t = torch.tensor(state, dtype=torch.float32, device = device).unsqueeze(0)
@@ -103,8 +104,9 @@ def experience_generator(env, policy, gamma, n_steps):
                     'action':int(action_list[0]),
                     'ret':ret,
                     'done':done_list[0],
-                    'last_state':last_state_list[n_steps-1] if not done else None, 
-                    'ep_reward': None
+                    'last_state':last_state_list[n_steps-1] if not done else None,  # if its the last state where done=True, set last_state = None. 
+                    'ep_reward': None,
+                    'ep_steps':None
                 }
                 
                 state_list.pop(0)
@@ -114,6 +116,7 @@ def experience_generator(env, policy, gamma, n_steps):
                 last_state_list.pop(0)
                 
             state = new_state
+            ep_steps += 1
                 
         else:
             while len(reward_list)>0:
@@ -125,7 +128,8 @@ def experience_generator(env, policy, gamma, n_steps):
                     'ret':ret,
                     'done':done_list[0],
                     'last_state': None, 
-                    'ep_reward': ep_rew if done_list[0] else None
+                    'ep_reward': ep_rew if done_list[0] else None,
+                    'ep_steps':ep_steps if done_list[0] else None,
                 }
                 
                 state_list.pop(0)
@@ -218,9 +222,9 @@ for step_idx, exp in enumerate(experience_generator(env, policy, GAMMA, REWARD_S
         print(f"episode : {episode_idx} | step: {step_idx} | episode reward : {episode_reward} | mean reward/100 eps : {mean_reward}")
         wandb.log({
             "episode_reward": episode_reward, 
-            "mean_reward_100": mean_reward,  # FIXED: No spaces in metric name
-            'episode_number': episode_idx,   # FIXED: More descriptive name
-            "steps_per_episode": step_idx / max(episode_idx, 1)
+            "mean_reward_100": mean_reward,  
+            'episode_number': episode_idx,   
+            "steps_per_episode": exp['ep_steps']
         }, step=step_idx)
         episode_idx += 1
         
