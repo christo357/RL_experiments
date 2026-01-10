@@ -1,7 +1,3 @@
-"""
-with no schedulers
-"""
-
 import gymnasium as gym 
 import numpy as np
 import pandas as pd
@@ -13,24 +9,23 @@ import wandb
 
 from gymnasium.wrappers.vector import RecordEpisodeStatistics
 import multiprocessing as mp
-import pickle
 
 
 HIDDEN_LAYER1  = 256
 # ALPHA = 0.95
-GAMMA = 0.99 # DISCOUNT FACTOR
+GAMMA = 0.95 # DISCOUNT FACTOR
 LAMBDA = 0.95 # FOR GAE
-LR = 3e-4
+LR = 1e-4
 # N_STEPS = 20
 ENV_ID = 'InvertedDoublePendulum-v5'
-N_ENVS = 8
-N_STEPS = 128
+N_ENVS = 4
+N_STEPS = 64
 BATCH_SIZE = N_ENVS * N_STEPS
 
-ENTROPY_BETA = 0.0005
-# ENTROPY_BETA_MIN = 1e-5
-# entropy_smoothing_factor = 0.05
-# total_updates = 500000 // BATCH_SIZE
+ENTROPY_BETA = 0.001
+ENTROPY_BETA_MIN = 1e-5
+entropy_smoothing_factor = 0.05
+total_updates = 500000 // BATCH_SIZE
 TARGET_REWARD = 9000
 
 
@@ -50,35 +45,6 @@ def smooth(old: tt.Optional[float], val: float, alpha: float = 0.95,) -> float:
         return val
     return old * alpha + (1-alpha)*val    
 
-def sync_envs(training_env, eval_env):
-    """
-    Copies the running mean/variance from training_env to eval_env.
-    """
-    # 1. Get the Normalization Wrapper from the training env
-    # 'obs_rms' is the object holding mean and var
-    if hasattr(training_env, 'obs_rms'):
-        training_obs_rms = training_env.obs_rms
-    # If hidden behind RecordEpisodeStatistics, peel back one layer
-    elif hasattr(training_env.env, 'obs_rms'):
-        training_obs_rms = training_env.env.obs_rms
-    else:
-        raise AttributeError("Could not find 'obs_rms' in training_env. Ensure NormalizeObservation is used.")
-
-    # --- 2. Get stats from Eval (Single) Env ---
-    # Same logic for the evaluation environment
-    if hasattr(eval_env, 'obs_rms'):
-        eval_obs_rms = eval_env.obs_rms
-    elif hasattr(eval_env.env, 'obs_rms'):
-        eval_obs_rms = eval_env.env.obs_rms
-    else:
-        raise AttributeError("Could not find 'obs_rms' in eval_env. Ensure NormalizeObservation is used.")
-    
-    # 3. Copy the statistics
-    eval_obs_rms.mean = training_obs_rms.mean.copy()
-    eval_obs_rms.var = training_obs_rms.var.copy()
-    eval_obs_rms.count = training_obs_rms.count
-
-
 def record_video(env, policy, device, low, high, max_steps=500, ):
     """Record a single episode and return frames + reward"""
     frames = []
@@ -92,7 +58,7 @@ def record_video(env, policy, device, low, high, max_steps=500, ):
     while not done and steps < max_steps:
         state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            mu, std = policy(state_tensor)
+            mu, std, _ = policy(state_tensor)
         dist = torch.distributions.Normal(mu, std)
         action = torch.clamp(dist.sample(), low, high)
 
@@ -107,31 +73,6 @@ def record_video(env, policy, device, low, high, max_steps=500, ):
         
     return frames, total_reward, steps
 
-# def save_checkpoint(path, policy, optimizer, envs):
-#     # Extract the running mean/std data
-#     obs_rms = envs.get_wrapper_attr('obs_rms')
-    
-#     checkpoint = {
-#         'model_state_dict': policy.state_dict(),
-#         'optimizer_state_dict': optimizer.state_dict(),
-#         # Pickle the normalization statistics
-#         'obs_rms_mean': obs_rms.mean,
-#         'obs_rms_var': obs_rms.var,
-#         'obs_rms_count': obs_rms.count
-#     }
-#     torch.save(checkpoint, path)
-    
-# def load_checkpoint(path, policy, envs):
-#     checkpoint = torch.load(path)
-#     policy.load_state_dict(checkpoint['model_state_dict'])
-    
-#     # Load stats back into the environment
-#     obs_rms = envs.get_wrapper_attr('obs_rms')
-#     obs_rms.mean = checkpoint['obs_rms_mean']
-#     obs_rms.var = checkpoint['obs_rms_var']
-#     obs_rms.count = checkpoint['obs_rms_count']
-    
-#     return policy
 
 def compute_gae(rewards, values, next_values, dones, gamma, lam):
     
@@ -168,15 +109,16 @@ class PolicyNet(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(self.input_size, self.fc), 
-            nn.Tanh(), 
+            nn.ReLU(), 
             nn.Linear(self.fc, self.fc), 
-            nn.Tanh()
+            nn.ReLU()
         )
         
         self.mu = nn.Linear(self.fc, self.action_dim)
         
         self.log_std = nn.Parameter(torch.zeros(self.action_dim))
         
+        self.critic_head = nn.Linear(self.fc, 1)
         
     def forward(self, x):
         x = self.net(x)
@@ -185,29 +127,8 @@ class PolicyNet(nn.Module):
         std = torch.exp(torch.clamp(self.log_std, self.log_std_min, self.log_std_max))
         std = std.expand_as(mu)
         
-        return mu, std
-    
-class CriticNet(nn.Module):
-    def __init__(self, input_size, fc, ):
-        super().__init__()
-        self.input_size = input_size
-        self.fc = fc
-        
-        self.net = nn.Sequential(
-            nn.Linear(self.input_size, self.fc), 
-            nn.Tanh(), 
-            nn.Linear(self.fc, self.fc), 
-            nn.Tanh()
-        )
-        
-        
-        self.critic_head = nn.Linear(self.fc, 1)
-        
-    def forward(self, x):
-        x = self.net(x)
-        
         val = self.critic_head(x)
-        return val
+        return mu, std, val
     
 class LinearBetaScheduler:
     def __init__(self, beta_start, beta_end, total_steps):
@@ -249,11 +170,10 @@ class BetaScheduler:
         return self.current_beta
 
 class VectorCollector:
-    def __init__(self, envs, policy, critic,  gamma, lam, n_steps,action_low, action_high,  device):
+    def __init__(self, envs, policy, gamma, lam, n_steps,action_low, action_high,  device):
         # super().__init__(self,)
         self.env = envs
         self.policy = policy
-        self.critic = critic
         self.gamma = gamma
         self.lam = lam
         self.n_steps = n_steps
@@ -263,8 +183,6 @@ class VectorCollector:
         
         self.state, _ = envs.reset()
         print(self.state)
-        self.action_low = action_low
-        self.action_high = action_high
         self.action_bias = (action_high + action_low) / 2
         self.action_scale = (action_high - action_low) / 2
                 
@@ -293,11 +211,10 @@ class VectorCollector:
             for _ in range(self.n_steps):
                 # print(f"state: {self.state}")
                 
-                state_t = torch.tensor(self.state, dtype=torch.float32, device=self.device)#.unsqueeze(0)
+                state_t = torch.tensor(self.state, dtype=torch.float32, device=device)#.unsqueeze(0)
                 # print(state_t)
                 with torch.no_grad():
-                    mu, std = self.policy(state_t)
-                    val = self.critic(state_t)
+                    mu, std, val = self.policy(state_t)
                 # print(f"mu: {mu}")
                 # print(f'std: {std}')
                 # print(f"val: {val}")
@@ -306,9 +223,9 @@ class VectorCollector:
                 # # print('std', std)
                 dist = torch.distributions.Normal(mu,std)
                 u = dist.sample()
-                action = torch.clamp(u, self.action_low, self.action_high )
-                # a = torch.tanh(u)
-                # action = a*self.action_scale + self.action_bias
+                a = torch.tanh(u)
+                
+                action = a*self.action_scale + self.action_bias
                 # print(f"action:{action}")
                 action_env = action.detach().cpu().numpy()
                 # action_env = action.squeeze(0).detach().cpu().numpy()
@@ -345,7 +262,8 @@ class VectorCollector:
                                 # print(f'idx: {idx}')
                                 # print(f"episode r: {info['episode']['r']}")
                                 episode_rewards.append(info['episode']['r'][idx])
-
+                # else: 
+                #     episode_rewards = []
                 # print(f'{episode_rewards}')
                 
                 self.state = next_state
@@ -358,7 +276,7 @@ class VectorCollector:
             # bootstrapping
             with torch.no_grad():
                 next_state_t = torch.tensor(next_state, dtype=torch.float32, device=device)
-                nxt_val = self.critic(next_state_t)
+                _, _, nxt_val = self.policy(next_state_t)
                 # print(f'next_val before squeeze dim=-1:{nxt_val}')
                 nxt_val = nxt_val.squeeze(dim=-1)
                 # print(f'next_val after squeeze dim=-1:{nxt_val}')
@@ -406,7 +324,7 @@ def main():
             'n_steps':N_STEPS,
             "batch_size":  BATCH_SIZE,
             "gamma": GAMMA,
-            # "entropy_beta_min": ENTROPY_BETA_MIN,
+            "entropy_beta_min": ENTROPY_BETA_MIN,
             # "entropy_smoothing_factor":entropy_smoothing_factor,
             'lr':LR,
             "entropy_beta":ENTROPY_BETA,
@@ -432,60 +350,43 @@ def main():
     
     # env = gym.make(ENV_ID)
     envs = gym.make_vec(ENV_ID, num_envs=N_ENVS, vectorization_mode='async' )
-    envs = gym.wrappers.vector.NormalizeObservation(envs) 
-    # envs = gym.wrappers.vector.TransformObservation(envs, lambda obs: np.clip(obs, -10, 10))
-    envs = RecordEpisodeStatistics(envs)
-    
-    
-    
+    envs = RecordEpisodeStatistics(envs) #handles reward logging
     eval_env = gym.make(ENV_ID, render_mode='rgb_array')
-    eval_env = gym.wrappers.NormalizeObservation(eval_env)
-    # eval_env = gym.wrappers.TransformObservation(eval_env, lambda obs: np.clip(obs, -10, 10))
+
             
 
     policy = PolicyNet(
         input_size=envs.single_observation_space.shape[0], 
         fc = HIDDEN_LAYER1, 
         action_dim=envs.single_action_space.shape[0], 
-        log_std_min=-2, 
+        log_std_min=-20, 
         log_std_max=1,
     ).to(device)
-    critic = CriticNet(
-        input_size=envs.single_observation_space.shape[0], 
-        fc = HIDDEN_LAYER1, 
-    ).to(device)
 
-    policy_optimizer = torch.optim.Adam(policy.parameters(), lr = LR)
-    # policy_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    #     policy_optimizer, 
-    #     mode='max', 
-    #     factor=0.5, 
-    #     patience=500,  # If reward doesn't go up for 500 steps, lower LR
-    # )
+    optimizer = torch.optim.Adam(policy.parameters(), lr = LR)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max', 
+        factor=0.5, 
+        patience=500,  # If reward doesn't go up for 500 steps, lower LR
+    )
 
-    critic_optimizer = torch.optim.Adam(critic.parameters(), lr = LR)
-    # critic_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    #     critic_optimizer, 
-    #     mode='max', 
-    #     factor=0.5, 
-    #     patience=500,  # If reward doesn't go up for 500 steps, lower LR
-    # )
     current_beta = ENTROPY_BETA
     # beta_scheduler = LinearBetaScheduler(
     #     beta_start=ENTROPY_BETA, 
     #     beta_end=ENTROPY_BETA_MIN, 
     #     total_steps=total_updates   # Decay fully in the first 33% of training
     # )
-    # beta_scheduler = BetaScheduler(
-    #     target_reward=TARGET_REWARD, 
-    #     beta_start=ENTROPY_BETA, 
-    #     beta_min=ENTROPY_BETA_MIN, 
-    #     smoothing_factor=entropy_smoothing_factor
-    # )
+    beta_scheduler = BetaScheduler(
+        target_reward=TARGET_REWARD, 
+        beta_start=ENTROPY_BETA, 
+        beta_min=ENTROPY_BETA_MIN, 
+        smoothing_factor=entropy_smoothing_factor
+    )
 
     action_low = torch.tensor(envs.single_action_space.low, dtype=torch.float32, device=device)
     action_high = torch.tensor(envs.single_action_space.high, dtype=torch.float32, device=device)
-    exp_collector = VectorCollector(envs, policy, critic, GAMMA, LAMBDA, N_STEPS,action_low, action_high, device)
+    exp_collector = VectorCollector(envs, policy, GAMMA, LAMBDA, N_STEPS,action_low, action_high, device)
     total_rewards = []
     episode_idx = 0
     mu_old = 0
@@ -500,20 +401,18 @@ def main():
     episode_count = 0
 
 
-    print("Recording initial video (before training)...")
-    print("Syncing normalization stats...")
-    sync_envs(envs, eval_env)
-    initial_frames, initial_reward, initial_steps = record_video(eval_env, policy, device, low = action_low, high = action_high)
-    wandb.log({
-        "video": wandb.Video(
-            np.array(initial_frames).transpose(0, 3, 1, 2), 
-            fps=30, 
-            format="mp4",
-            caption=f"Initial (untrained) - Reward: {initial_reward}, Steps: {initial_steps}"
-        ),
-        "initial_reward": initial_reward
-    }, step=0)
-    print(f"Initial reward: {initial_reward}, steps: {initial_steps}")
+    # print("Recording initial video (before training)...")
+    # initial_frames, initial_reward, initial_steps = record_video(eval_env, policy, device, low = action_low, high = action_high)
+    # wandb.log({
+    #     "video": wandb.Video(
+    #         np.array(initial_frames).transpose(0, 3, 1, 2), 
+    #         fps=30, 
+    #         format="mp4",
+    #         caption=f"Initial (untrained) - Reward: {initial_reward}, Steps: {initial_steps}"
+    #     ),
+    #     "initial_reward": initial_reward
+    # }, step=0)
+    # print(f"Initial reward: {initial_reward}, steps: {initial_steps}")
 
 
     for step_idx, exp in enumerate(exp_collector.rollout()):
@@ -524,7 +423,7 @@ def main():
                 episode_count += 1
                 
                 # Update trackers
-                # current_beta = beta_scheduler.update(ep_rew)
+                current_beta = beta_scheduler.update(ep_rew)
                 total_rewards.append(ep_rew)
                 mean_reward = float(np.mean(total_rewards[-100:]))
                 
@@ -554,8 +453,7 @@ def main():
         flat_returns = exp['returns'].view(-1)
         flat_adv = exp['adv'].view(-1)
 
-        mu_new, std = policy(flat_states)
-        value = critic(flat_states)
+        mu_new, std, value = policy(flat_states)
         # print(value)
         value_t = value.squeeze(dim=-1)
         # print('values',value_t)
@@ -566,19 +464,12 @@ def main():
         delta = 1.0
         loss_value = F.smooth_l1_loss(value_t,flat_returns.detach(), beta=delta)
         
-        critic_optimizer.zero_grad()
-        loss_value.backward()
-        torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=0.5)
-        critic_optimizer.step()
-        # critic_scheduler.step(mean_reward)
-        
-        
         
         dist_t = torch.distributions.Normal(mu_new, std)
-        logp = dist_t.log_prob(flat_actions).sum(dim=-1)
-        # a_t = torch.tanh(flat_actions)
-        # logp_correction = torch.log(( 1 - a_t.pow(2))+1e-6).sum(dim=-1)
-        # logp = logp_u - logp_correction
+        logp_u = dist_t.log_prob(flat_actions).sum(dim=-1)
+        a_t = torch.tanh(flat_actions)
+        logp_correction = torch.log(( 1 - a_t.pow(2))+1e-6).sum(dim=-1)
+        logp = logp_u - logp_correction
         
         
         flat_adv = (flat_adv - flat_adv.mean())/(flat_adv.std() + 1e-8) # normalize adv_t after returns
@@ -589,19 +480,19 @@ def main():
         
         entropy = dist_t.entropy().sum(dim=-1).mean()
         
-        loss_total = loss_policy - current_beta*entropy
+        loss_total = loss_value + loss_policy - current_beta*entropy
         
-        policy_optimizer.zero_grad()
+        optimizer.zero_grad()
         loss_total.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
-        policy_optimizer.step()
-        # policy_scheduler.step(mean_reward)
+        optimizer.step()
+        scheduler.step(mean_reward)
         
         
         
         with torch.no_grad():
             
-            mu_t, std_t = policy(flat_states)
+            mu_t, std_t, v_t = policy(flat_states)
             new_dist_t = torch.distributions.Normal(mu_t, std_t)
             
             kl_div = torch.distributions.kl_divergence(dist_t, new_dist_t).mean()
@@ -623,7 +514,7 @@ def main():
         l_entropy = smooth(l_entropy, entropy.item())
         l_policy = smooth(l_policy, loss_policy.item())
         l_value = smooth(l_value, loss_value.item())
-        l_total = smooth(l_total, loss_total.item()+loss_value.item())
+        l_total = smooth(l_total, loss_total.item())
         
         
         
@@ -646,7 +537,7 @@ def main():
                 "std_mean": std.mean().item(), # Is the policy collapsing to deterministic?
                 
                 # --- Action Diagnostics ---
-                "action_saturation": (flat_actions.abs() > 0.99).float().mean().item(), # CRITICAL METRIC
+                "action_saturation": (a_t.abs() > 0.99).float().mean().item(), # CRITICAL METRIC
                 "action_mean": flat_actions.mean().item(),
                 "action_std": flat_actions.std().item(),
                 
@@ -696,8 +587,6 @@ def main():
         
     # NEW: Record final video (after training)
     print("\nRecording final video (after training)...")
-    print("Syncing normalization stats...")
-    sync_envs(envs, eval_env)
     final_frames, final_reward, final_steps = record_video(eval_env, policy, device, low=action_low, high =action_high)
     wandb.log({
         "video": wandb.Video(
